@@ -1,0 +1,133 @@
+name: weg.li-Export holen
+
+on:
+  schedule:
+    # weg.li erzeugt den Export montags gegen 03:05 deutscher Zeit, also
+    # 01:05 UTC im Sommer und 02:05 UTC im Winter. 02:30 UTC liegt in
+    # beiden Fällen danach.
+    - cron: "30 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wegli-export
+  cancel-in-progress: false
+
+env:
+  KEEP: 8
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Neuesten CSV-Export ermitteln
+        id: pick
+        env:
+          WEG_LI_API_KEY: ${{ secrets.WEG_LI_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WEG_LI_API_KEY:-}" ]; then
+            echo "::error::Secret WEG_LI_API_KEY fehlt"; exit 1
+          fi
+          curl -sS --fail --retry 3 --max-time 60 \
+            -H "X-API-KEY: ${WEG_LI_API_KEY}" \
+            -o exports.json https://www.weg.li/api/exports/public
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, re, sys
+          daten = json.load(open("exports.json"))
+          muster = re.compile(r"^notices-csv-(\d{2})-(\d{2})-(\d{4})-\d{2}-\d{2}\.zip$")
+          kandidaten = [
+              e for e in daten
+              if e.get("export_type") == "notices"
+              and e.get("file_extension") == "csv"
+              and muster.match(e.get("download", {}).get("filename", ""))
+          ]
+          if not kandidaten:
+              sys.exit("Kein CSV-Export in der Antwort gefunden")
+          neu = max(kandidaten, key=lambda e: e["created_at"])
+          name = neu["download"]["filename"]
+          t, m, j = muster.match(name).groups()
+          print(f"tag={j}-{m}-{t}")
+          print(f"file={name}")
+          print(f"url={neu['download']['url']}")
+          print(f"created={neu['created_at']}")
+          PY
+          cat "$GITHUB_OUTPUT"
+
+      - name: Gibt es das Release schon?
+        id: exists
+        run: |
+          if gh release view "${{ steps.pick.outputs.tag }}" > /dev/null 2>&1; then
+            echo "Release ${{ steps.pick.outputs.tag }} existiert bereits – nichts zu tun."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Herunterladen
+        if: steps.exists.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          curl -sS --fail -L --retry 3 --max-time 600 \
+            -o "${{ steps.pick.outputs.file }}" "${{ steps.pick.outputs.url }}"
+          ls -l "${{ steps.pick.outputs.file }}"
+
+      - name: ZIP prüfen
+        if: steps.exists.outputs.skip == 'false'
+        env:
+          DATEI: ${{ steps.pick.outputs.file }}
+        run: |
+          python3 - <<'PY'
+          import os, sys, zipfile
+          KOPF = "start_date,end_date,tbnr,street,city,zip,latitude,longitude"
+          datei = os.environ["DATEI"]
+          try:
+              z = zipfile.ZipFile(datei)
+          except zipfile.BadZipFile as e:
+              sys.exit(f"Keine gültige ZIP-Datei: {e}")
+          kaputt = z.testzip()
+          if kaputt:
+              sys.exit(f"CRC-Fehler in {kaputt}")
+          csvs = [n for n in z.namelist() if n.lower().endswith(".csv")]
+          if not csvs:
+              sys.exit("Keine CSV in der ZIP-Datei")
+          for n in csvs:
+              with z.open(n) as h:
+                  kopf = h.readline().decode("utf-8-sig").strip()
+              zeilen = 0
+              with z.open(n) as h:
+                  for zeilen, _ in enumerate(h, 1):
+                      pass
+              print(f"{n}: Kopf={kopf!r}, {zeilen} Zeilen, {z.getinfo(n).file_size} Bytes")
+              if kopf == KOPF and zeilen > 1:
+                  print("Prüfung bestanden")
+                  break
+          else:
+              sys.exit(f"Keine CSV mit der Kopfzeile {KOPF!r} und Daten gefunden")
+          PY
+
+      - name: Release anlegen
+        if: steps.exists.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          gh release create "${{ steps.pick.outputs.tag }}" \
+            "${{ steps.pick.outputs.file }}" \
+            --target "${{ github.sha }}" \
+            --title "weg.li-Export ${{ steps.pick.outputs.tag }}" \
+            --notes "Öffentlicher Datenexport von weg.li, unverändert (${{ steps.pick.outputs.file }}, erzeugt ${{ steps.pick.outputs.created }})."
+
+      - name: Alte Releases löschen (nur die letzten ${{ env.KEEP }} behalten)
+        run: |
+          set -euo pipefail
+          gh release list --limit 200 --json tagName --jq '.[].tagName' \
+            | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | sort -r \
+            | tail -n +$((KEEP + 1)) \
+            | while read -r tag; do
+                echo "Lösche Release $tag"
+                gh release delete "$tag" --cleanup-tag --yes
+              done
