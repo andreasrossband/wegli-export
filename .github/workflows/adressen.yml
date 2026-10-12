@@ -1,0 +1,89 @@
+name: Adressverzeichnis München
+
+on:
+  schedule:
+    - cron: "0 3 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: adressen
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  TAG: adressen
+  DATEI: adressen-muenchen.csv
+
+jobs:
+  adressen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Adressen bei Overpass abrufen und prüfen
+        run: |
+          set -uo pipefail
+          cat > abfrage.overpassql <<'Q'
+          [out:json][timeout:600];
+          ( area["boundary"="administrative"]["admin_level"="6"]["name"="München"];
+            area["boundary"="administrative"]["admin_level"="6"]["name"="Landkreis München"]; )->.a;
+          nwr["addr:housenumber"](area.a);
+          out center tags;
+          Q
+          SERVER="https://overpass-api.de/api/interpreter
+          https://overpass.kumi.systems/api/interpreter
+          https://overpass.private.coffee/api/interpreter"
+          # Die Overpass-Server sind oft überlastet (504/502); deshalb mehrere Runden.
+          for runde in 1 2 3; do
+            for url in $SERVER; do
+              echo "::group::Runde $runde: $url"
+              rm -f osm.json "$DATEI"
+              if curl -sS --fail --max-time 900 \
+                   -A "wegli-export (rossband.com)" \
+                   --data-urlencode data@abfrage.overpassql \
+                   -o osm.json "$url" \
+                 && python3 tools/adressen.py osm.json "$DATEI"; then
+                echo "::endgroup::"
+                echo "Quelle: $url"
+                echo "QUELLE=$url" >> "$GITHUB_ENV"
+                exit 0
+              fi
+              echo "::endgroup::"
+              echo "::warning::$url fehlgeschlagen"
+            done
+            [ $runde -lt 3 ] && sleep 120
+          done
+          echo "::error::Kein Server lieferte ein gültiges Ergebnis – bisherige Datei bleibt stehen."
+          exit 1
+
+      - name: Release aktualisieren
+        run: |
+          set -euo pipefail
+          zeilen=$(( $(wc -l < "$DATEI") - 1 ))
+          stand=$(python3 -c 'import json;print(json.load(open("osm.json"))["osm3s"]["timestamp_osm_base"])')
+          {
+            echo "Alle Adressen mit Hausnummer und Straße in der Stadt und im Landkreis München aus OpenStreetMap."
+            echo
+            echo "- Abgerufen: $(date -u +'%Y-%m-%d %H:%M') UTC"
+            echo "- OSM-Datenstand: $stand"
+            echo "- Zeilen: $zeilen"
+            echo "- Quelle: $QUELLE"
+            echo
+            echo "Spalten: \`lat,lon,strasse,hausnummer,plz,ort\`"
+            echo
+            echo "Daten © OpenStreetMap-Mitwirkende, Lizenz ODbL (https://www.openstreetmap.org/copyright)."
+          } > notizen.md
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" "$DATEI" --clobber
+            gh release edit "$TAG" --notes-file notizen.md --latest=false
+          else
+            # --latest=false: "releases/latest" soll weiter auf den weg.li-Export zeigen
+            gh release create "$TAG" "$DATEI" --target "${{ github.sha }}" \
+              --title "Adressverzeichnis München" --notes-file notizen.md --latest=false
+          fi
+          ls -l "$DATEI"
