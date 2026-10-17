@@ -18,19 +18,26 @@ env:
   TAG: adressen
   DATEI: adressen-muenchen.csv
   DATEI_SB: stadtbezirke-muenchen.geojson
+  # OSM-Datenstand und Zeilenzahl der CSV, die im Release liegt
+  DATEI_STAND: adressen-stand.txt
   # WFS-Ressource „WFS (GeoJSON)“ des Datensatzes vablock_stadtbezirke_opendata (opendata.muenchen.de)
   WFS_SB: "https://geoportal.muenchen.de/geoserver/gsm_wfs/ows?service=WFS&version=1.0.0&request=GetFeature&typeName=gsm_wfs:vablock_stadtbezirk&outputFormat=application/json"
 
 jobs:
   adressen:
-    runs-on: ubuntu-latest
+    # fest statt ubuntu-latest, damit der Wechsel auf Ubuntu 26 nichts kaputt macht
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
+      # Schlägt dieser Schritt fehl, bleibt die bisherige Bezirksdatei im Release stehen
       - name: Stadtbezirksgrenzen abrufen und prüfen
+        id: bezirke
+        continue-on-error: true
         run: |
           set -euo pipefail
+          rm -f "$DATEI_SB"
           pip install --quiet pyproj
           curl -sS --fail --retry 3 --retry-delay 30 --max-time 300 \
             -A "wegli-export (rossband.com)" -o stadtbezirke-wfs.json "$WFS_SB"
@@ -62,6 +69,7 @@ jobs:
                 echo "::endgroup::"
                 echo "Quelle: $url"
                 echo "QUELLE=$url" >> "$GITHUB_ENV"
+                echo "ADRESSEN_OK=ja" >> "$GITHUB_ENV"
                 exit 0
               fi
               echo "::endgroup::"
@@ -72,18 +80,80 @@ jobs:
           echo "::error::Kein Server lieferte ein gültiges Ergebnis – bisherige Datei bleibt stehen."
           exit 1
 
+      # Läuft auch, wenn Overpass ganz ausfiel – dann werden nur die Bezirke hochgeladen
       - name: Release aktualisieren
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
-          zeilen=$(( $(wc -l < "$DATEI") - 1 ))
-          stand=$(python3 -c 'import json;print(json.load(open("osm.json"))["osm3s"]["timestamp_osm_base"])')
+          wert() { sed -n "/^$1=/{s///p;q}" "$2"; }
+
+          # Stand der bisherigen CSV: aus adressen-stand.txt, bei älteren Releases aus dem Release-Text
+          rm -f alt-stand.txt
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            RELEASE=ja
+            if ! gh release download "$TAG" -p "$DATEI_STAND" -O alt-stand.txt 2> /dev/null; then
+              gh release view "$TAG" --json body --jq .body | tr -d '\r' | sed -n \
+                -e 's/^- OSM-Datenstand: /stand=/p' -e 's/^- Zeilen: /zeilen=/p' \
+                -e 's/^- Abgerufen: \(.*\) UTC$/abgerufen=\1/p' -e 's/^- Quelle: /quelle=/p' > alt-stand.txt
+            fi
+          else
+            RELEASE=nein
+            : > alt-stand.txt
+          fi
+          alt_stand=$(wert stand alt-stand.txt); alt_zeilen=$(wert zeilen alt-stand.txt)
+          echo "Bisher im Release: Stand ${alt_stand:-?}, ${alt_zeilen:-?} Zeilen"
+
+          CSV_HOCH=nein
+          grund=""
+          if [ "${ADRESSEN_OK:-}" != ja ]; then
+            grund="kein Overpass-Server lieferte ein gültiges Ergebnis"
+          else
+            neu_stand=$(python3 -c 'import json;print(json.load(open("osm.json"))["osm3s"]["timestamp_osm_base"])')
+            neu_zeilen=$(( $(wc -l < "$DATEI") - 1 ))
+            echo "Neu von $QUELLE: Stand $neu_stand, $neu_zeilen Zeilen"
+            # ISO-Zeitstempel in UTC (…Z) lassen sich als Text vergleichen
+            if [ -n "$alt_stand" ] && [[ "$neu_stand" < "$alt_stand" ]]; then
+              grund="OSM-Datenstand $neu_stand älter als bisher $alt_stand"
+            elif [ -n "$alt_zeilen" ] && [ $(( neu_zeilen * 100 )) -lt $(( alt_zeilen * 98 )) ]; then
+              grund="$neu_zeilen Zeilen, mehr als 2 % weniger als bisher $alt_zeilen"
+            else
+              CSV_HOCH=ja
+              {
+                echo "stand=$neu_stand"
+                echo "zeilen=$neu_zeilen"
+                echo "abgerufen=$(date -u +'%Y-%m-%d %H:%M')"
+                echo "quelle=$QUELLE"
+              } > "$DATEI_STAND"
+            fi
+          fi
+          if [ "$CSV_HOCH" = ja ]; then
+            stand_datei="$DATEI_STAND"
+          else
+            echo "::warning::$DATEI nicht ersetzt: $grund – die bisherige Datei bleibt stehen."
+            stand_datei=alt-stand.txt
+          fi
+
+          dateien=()
+          if [ "$CSV_HOCH" = ja ]; then
+            dateien+=("$DATEI" "$DATEI_STAND")
+          fi
+          if [ "${{ steps.bezirke.outcome }}" = success ] && [ -f "$DATEI_SB" ]; then
+            dateien+=("$DATEI_SB")
+          else
+            echo "::warning::$DATEI_SB nicht ersetzt: Abruf oder Prüfung fehlgeschlagen – die bisherige Datei bleibt stehen."
+          fi
+
           {
             echo "Alle Adressen mit Hausnummer und Straße in der Stadt und im Landkreis München aus OpenStreetMap."
             echo
-            echo "- Abgerufen: $(date -u +'%Y-%m-%d %H:%M') UTC"
-            echo "- OSM-Datenstand: $stand"
-            echo "- Zeilen: $zeilen"
-            echo "- Quelle: $QUELLE"
+            echo "- Abgerufen: $(wert abgerufen "$stand_datei") UTC"
+            echo "- OSM-Datenstand: $(wert stand "$stand_datei")"
+            echo "- Zeilen: $(wert zeilen "$stand_datei")"
+            echo "- Quelle: $(wert quelle "$stand_datei")"
+            if [ "$CSV_HOCH" != ja ]; then
+              echo
+              echo "Letzter Lauf $(date -u +'%Y-%m-%d %H:%M') UTC: CSV nicht ersetzt ($grund)."
+            fi
             echo
             echo "Spalten: \`lat,lon,strasse,hausnummer,plz,ort\`"
             echo
@@ -93,12 +163,14 @@ jobs:
             echo
             echo "Stadtbezirke: Landeshauptstadt München, Datenlizenz Deutschland – Namensnennung 2.0 (dl-de/by-2-0)"
           } > notizen.md
-          if gh release view "$TAG" > /dev/null 2>&1; then
-            gh release upload "$TAG" "$DATEI" "$DATEI_SB" --clobber
+          if [ "$RELEASE" = ja ]; then
+            if [ ${#dateien[@]} -gt 0 ]; then
+              gh release upload "$TAG" "${dateien[@]}" --clobber
+            fi
             gh release edit "$TAG" --notes-file notizen.md --latest=false
           else
             # --latest=false: "releases/latest" soll weiter auf den weg.li-Export zeigen
-            gh release create "$TAG" "$DATEI" "$DATEI_SB" --target "${{ github.sha }}" \
+            gh release create "$TAG" "${dateien[@]}" --target "${{ github.sha }}" \
               --title "Adressverzeichnis München" --notes-file notizen.md --latest=false
           fi
-          ls -l "$DATEI" "$DATEI_SB"
+          echo "Hochgeladen: ${dateien[*]:-nichts}"
