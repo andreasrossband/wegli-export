@@ -17,6 +17,9 @@ env:
   GH_REPO: ${{ github.repository }}
   TAG: adressen
   DATEI: adressen-muenchen.csv
+  DATEI_SB: stadtbezirke-muenchen.geojson
+  # WFS-Ressource „WFS (GeoJSON)“ des Datensatzes vablock_stadtbezirke_opendata (opendata.muenchen.de)
+  WFS_SB: "https://geoportal.muenchen.de/geoserver/gsm_wfs/ows?service=WFS&version=1.0.0&request=GetFeature&typeName=gsm_wfs:vablock_stadtbezirk&outputFormat=application/json"
 
 jobs:
   adressen:
@@ -24,6 +27,14 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+
+      - name: Stadtbezirksgrenzen abrufen und prüfen
+        run: |
+          set -euo pipefail
+          pip install --quiet pyproj
+          curl -sS --fail --retry 3 --retry-delay 30 --max-time 300 \
+            -A "wegli-export (rossband.com)" -o stadtbezirke-wfs.json "$WFS_SB"
+          python3 tools/stadtbezirke.py stadtbezirke-wfs.json "$DATEI_SB"
 
       - name: Adressen bei Overpass abrufen und prüfen
         run: |
@@ -77,13 +88,17 @@ jobs:
             echo "Spalten: \`lat,lon,strasse,hausnummer,plz,ort\`"
             echo
             echo "Daten © OpenStreetMap-Mitwirkende, Lizenz ODbL (https://www.openstreetmap.org/copyright)."
+            echo
+            echo "\`$DATEI_SB\`: Grenzen der 25 Münchner Stadtbezirke, GeoJSON in WGS84 (lon/lat), Properties \`nr\` (1–25) und \`name\`."
+            echo
+            echo "Stadtbezirke: Landeshauptstadt München, Datenlizenz Deutschland – Namensnennung 2.0 (dl-de/by-2-0)"
           } > notizen.md
           if gh release view "$TAG" > /dev/null 2>&1; then
-            gh release upload "$TAG" "$DATEI" --clobber
+            gh release upload "$TAG" "$DATEI" "$DATEI_SB" --clobber
             gh release edit "$TAG" --notes-file notizen.md --latest=false
           else
             # --latest=false: "releases/latest" soll weiter auf den weg.li-Export zeigen
-            gh release create "$TAG" "$DATEI" --target "${{ github.sha }}" \
+            gh release create "$TAG" "$DATEI" "$DATEI_SB" --target "${{ github.sha }}" \
               --title "Adressverzeichnis München" --notes-file notizen.md --latest=false
           fi
-          ls -l "$DATEI"
+          ls -l "$DATEI" "$DATEI_SB"
