@@ -156,6 +156,8 @@ def main():
         with zipfile.ZipFile(a.alt_zip) as z:
             alt = {n: z.read(n) for n in z.namelist() if n.lower().endswith(".jpg")}
 
+    geladen = set()
+
     def eintrag(n):
         nid = str(n.get("token") or n.get("id"))
         fotos = [f for f in (n.get("photos") or []) if foto_url(f)]
@@ -167,6 +169,7 @@ def main():
                 bild = None   # aus einem Lauf mit anderen Grenzen - neu laden
             if bild is None:
                 bild = verkleinere(hole(foto_url(fotos[0])))
+                geladen.add(nid)
         lz = lokalzeit(n["start_date"])
         lat, lng = n.get("latitude"), n.get("longitude")
         return {
@@ -187,7 +190,7 @@ def main():
         ergebnisse = list(pool.map(eintrag, roller))
 
     items = sorted((e for e, _ in ergebnisse), key=lambda e: (e["date"], e["time"], e["id"]), reverse=True)
-    neu = sum(1 for (e, b) in ergebnisse if b is not None and f"{e['id']}.jpg" not in alt)
+    neu = len(geladen)
 
     os.makedirs(a.out, exist_ok=True)
     with zipfile.ZipFile(os.path.join(a.out, "roller-fotos.zip"), "w", zipfile.ZIP_STORED) as z:
