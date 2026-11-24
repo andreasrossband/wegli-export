@@ -69,5 +69,5 @@ jobs:
             gh release create "$TAG" neu/roller-fotos.zip neu/roller-meta.json \
               --latest=false \
               --title "Eigene Roller-Anzeigen (TBNR 101133)" \
-              --notes "Eigene weg.li-Anzeigen zu E-Rollern (TBNR 101133) mit verkleinerter Totale, wöchentlich überschrieben. roller-meta.json: Liste, roller-fotos.zip: <id>.jpg (max. 480 px, ohne EXIF)."
+              --notes "Eigene weg.li-Anzeigen zu E-Rollern (TBNR 101133) mit verkleinerter Totale, wöchentlich überschrieben. roller-meta.json: Liste, roller-fotos.zip: <id>.jpg (max. 480 x 640 px, ohne EXIF)."
           fi
