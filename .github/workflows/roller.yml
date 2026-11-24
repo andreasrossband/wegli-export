@@ -1,0 +1,73 @@
+name: Roller-Anzeigen (eigene, TBNR 101133)
+
+on:
+  schedule:
+    # montags 05:00 UTC, nach dem öffentlichen Wochen-Export (export.yml)
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: roller
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  TAG: roller
+
+jobs:
+  roller:
+    # fest statt ubuntu-latest, damit der Wechsel auf Ubuntu 26 nichts kaputt macht
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Pillow installieren
+        run: python3 -m pip install --quiet "Pillow==11.3.0"
+
+      # Fotos und Liste des letzten Laufs holen, damit nur Neues geladen wird.
+      # Gibt es das Release noch nicht, ist das der erste Lauf; jeder andere
+      # Fehler beim Herunterladen macht den Lauf rot.
+      - name: Letzten Stand holen
+        id: alt
+        run: |
+          set -euo pipefail
+          mkdir -p alt
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release download "$TAG" -D alt -p roller-fotos.zip -p roller-meta.json
+            echo "da=true" >> "$GITHUB_OUTPUT"
+            ls -l alt
+          else
+            echo "Release $TAG gibt es noch nicht - erster Lauf"
+            echo "da=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Schlägt dieser Schritt fehl, bricht der Lauf ab und das Release bleibt,
+      # wie es ist
+      - name: Anzeigen und Fotos abrufen
+        env:
+          WEG_LI_API_KEY: ${{ secrets.WEG_LI_API_KEY }}
+        run: |
+          python3 tools/roller.py --out neu \
+            --alt-zip alt/roller-fotos.zip --alt-meta alt/roller-meta.json
+          ls -l neu
+
+      # Erst die Fotos, dann die Liste: so verweist die Liste nie auf ein Foto,
+      # das noch nicht hochgeladen ist. --latest=false, weil die README den
+      # Wochen-Export über releases/latest abruft.
+      - name: Release aktualisieren
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.alt.outputs.da }}" = "true" ]; then
+            gh release upload "$TAG" neu/roller-fotos.zip --clobber
+            gh release upload "$TAG" neu/roller-meta.json --clobber
+          else
+            gh release create "$TAG" neu/roller-fotos.zip neu/roller-meta.json \
+              --latest=false \
+              --title "Eigene Roller-Anzeigen (TBNR 101133)" \
+              --notes "Eigene weg.li-Anzeigen zu E-Rollern (TBNR 101133) mit verkleinerter Totale, wöchentlich überschrieben. roller-meta.json: Liste, roller-fotos.zip: <id>.jpg (max. 480 px, ohne EXIF)."
+          fi
