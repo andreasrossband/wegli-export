@@ -5,7 +5,7 @@ seitenweise (wie die Wegli-Melder-App: GET /api/notices?page=N&per_page=100,
 Header X-API-KEY) und schreibt nach --out:
 
   roller-meta.json   {"stand": ..., "items": [...]}
-  roller-fotos.zip   flach, <anzeige-id>.jpg, max. 480 px breit, ohne EXIF
+  roller-fotos.zip   flach, <anzeige-id>.jpg, max. 480 x 640 px, ohne EXIF
 
 Totale = das erste Foto der Anzeige (wie in der App: der Roller-Weg lädt die
 Gesamtansicht als Pflichtfoto zuerst hoch, Name roller_<zeit>_1.jpg). Trägt
@@ -36,6 +36,7 @@ from PIL import Image, ImageOps
 HOST = "https://www.weg.li"
 TBNR = "101133"
 BREITE = 480
+HOEHE = 640   # Hochkant 9:16 wird sonst 853 px hoch und sprengt 40 KB
 QUALITAET = 70
 ZIEL_BYTES = 40 * 1024
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -100,8 +101,9 @@ def foto_name(f):
 def verkleinere(roh):
     with Image.open(io.BytesIO(roh)) as bild:
         bild = ImageOps.exif_transpose(bild).convert("RGB")
-        if bild.width > BREITE:
-            bild = bild.resize((BREITE, round(bild.height * BREITE / bild.width)), Image.LANCZOS)
+        f = min(BREITE / bild.width, HOEHE / bild.height, 1.0)
+        if f < 1.0:
+            bild = bild.resize((round(bild.width * f), round(bild.height * f)), Image.LANCZOS)
         q = QUALITAET
         while True:
             out = io.BytesIO()
@@ -110,6 +112,11 @@ def verkleinere(roh):
             if out.tell() <= ZIEL_BYTES or q <= 40:
                 return out.getvalue()
             q -= 10
+
+
+def passt(jpg):
+    with Image.open(io.BytesIO(jpg)) as b:
+        return b.width <= BREITE and b.height <= HOEHE
 
 
 def lokalzeit(iso):
@@ -156,6 +163,8 @@ def main():
         if fotos:
             art = "totale" if TOTALE.match(foto_name(fotos[0])) else "fallback"
             bild = alt.get(f"{nid}.jpg")
+            if bild is not None and not passt(bild):
+                bild = None   # aus einem Lauf mit anderen Grenzen - neu laden
             if bild is None:
                 bild = verkleinere(hole(foto_url(fotos[0])))
         lz = lokalzeit(n["start_date"])
